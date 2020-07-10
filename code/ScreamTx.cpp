@@ -22,7 +22,6 @@
 static const bool kEnableConsecutiveFastStart = true;
 // Packet pacing reduces jitter
 static const bool kEnablePacketPacing = true;
-static const float kPacketPacingHeadRoom = 1.5f;
 
 // Rate update interval
 static const uint32_t kRateAdjustInterval_ntp = 13107; // 200ms in NTP domain
@@ -40,7 +39,7 @@ static const float kQueueDelayTargetMax = 0.3f; //ms
 
 // Congestion window validation
 static const float kBytesInFlightHistInterval_ntp = 65536; // Time (s) between stores=1s in NTP doain
-static const float kMaxBytesInFlightHeadRoom = 1.2f;
+static const float kMaxBytesInFlightHeadRoom = 1.25f;
 // Queue delay trend and shared bottleneck detection
 static const uint32_t kQueueDelayFractionHistInterval_us = 3277; // 50ms in NTP domain
 // video rate estimation update period
@@ -72,7 +71,7 @@ ScreamTx::ScreamTx(float lossBeta_,
 	float gainUp_,
 	float gainDown_,
 	int cwnd_,
-	float cautiousPacing_,
+	float packetPacingHeadroom_,
 	int bytesInFlightHistSize_,
 	bool isL4s_,
 	bool openWindow_,
@@ -85,7 +84,7 @@ ScreamTx::ScreamTx(float lossBeta_,
 	enableSbd(enableSbd_),
 	gainUp(gainUp_),
 	gainDown(gainDown_),
-	cautiousPacing(cautiousPacing_),
+	packetPacingHeadroom(packetPacingHeadroom_),
 	bytesInFlightHistSize(bytesInFlightHistSize_),
 	isL4s(isL4s_),
 	openWindow(openWindow_),
@@ -118,6 +117,7 @@ ScreamTx::ScreamTx(float lossBeta_,
 	wasLossEvent(false),
 	lossEventRate(0.0),
 	ecnCeEvent(false),
+	isCeThisFeedback(false),
 	l4sAlpha(0.1f),
 	bytesMarkedThisRtt(0),
 	bytesDeliveredThisRtt(0),
@@ -152,6 +152,9 @@ ScreamTx::ScreamTx(float lossBeta_,
 	clockDriftCompensation(0),
 	clockDriftCompensationInc(0),
 
+	bytesNewlyAckedLog(0),
+	ecnCeMarkedBytesLog(0),
+        isUseExtraDetailedLog(false),
 	fp_log(0),
 	completeLogItem(false)
 {
@@ -527,7 +530,8 @@ float ScreamTx::isOkToTransmit(uint32_t time_ntp, uint32_t &ssrc) {
 float ScreamTx::addTransmitted(uint32_t time_ntp,
 	uint32_t ssrc,
 	int size,
-	uint16_t seqNr) {
+	uint16_t seqNr,
+        bool isMark) {
 	if (!isInitialized)
 		initialize(time_ntp);
 
@@ -541,6 +545,7 @@ float ScreamTx::addTransmitted(uint32_t time_ntp,
 	txPacket->timeTx_ntp = time_ntp;
 	txPacket->size = size;
 	txPacket->seqNr = seqNr;
+	txPacket->isMark = isMark;
 	txPacket->isUsed = true;
 	txPacket->isAcked = false;
 	txPacket->isAfterReceivedEdge = false;
@@ -701,25 +706,22 @@ void ScreamTx::incomingStandardizedFeedback(uint32_t time_ntp,
 	/*
 	* Mark received packets, given by the ACK vector
 	*/
-	uint16_t ecnCeMarkedBytes = 0;
-	markAcked(time_ntp, txPackets, seqNr, timestamp, stream, ceBits, ecnCeMarkedBytes, isLast);
-	stream->ecnCeMarkedBytes += ecnCeMarkedBytes;
+    bool isMark = false;
+	isCeThisFeedback |= markAcked(time_ntp, txPackets, seqNr, timestamp, stream, ceBits, ecnCeMarkedBytesLog, isLast, isMark);
 
 	/*
 	* Detect lost packets
 	*/
-	if (isLast) {
+	if (isUseExtraDetailedLog || isLast || isMark) {
 		detectLoss(time_ntp, txPackets, seqNr, stream);
+        }
 
-		if (bytesMarkedThisRtt != 0 && time_ntp - lastLossEventT_ntp > sRtt_ntp) {
+	if (isLast) {
+		if (isCeThisFeedback && time_ntp - lastLossEventT_ntp > sRtt_ntp) {
 			ecnCeEvent = true;
 			lastLossEventT_ntp = time_ntp;
 		}
-
-		if (fp_log && completeLogItem) {
-			fprintf(fp_log, " %d,%d,%1.0f,%d,%d,%d,%1.0f,%1.0f,%1.0f,%1.0f,%1.0f,%s", cwnd, bytesInFlight, rateTransmitted, streamId, bytesNewlyAcked, ecnCeMarkedBytes, stream->rateRtp, stream->rateTransmitted, stream->rateAcked, stream->rateLost, stream->rateCe, detailedLogExtraData);
-		}
-
+		isCeThisFeedback = false;
 		if (isL4s) {
 			/*
 			* L4S mode compute a congestion scaling factor that is dependent on the fraction
@@ -773,24 +775,38 @@ void ScreamTx::incomingStandardizedFeedback(uint32_t time_ntp,
 			lastCwndUpdateT_ntp = time_ntp;
 		}
 
+	}
+	if (isUseExtraDetailedLog || isLast || isMark) {
+
+		if (fp_log && completeLogItem) {
+			fprintf(fp_log, " %d,%d,%d,%1.0f,%d,%d,%d,%d,%1.0f,%1.0f,%1.0f,%1.0f,%1.0f,%d", cwnd, bytesInFlight, inFastStart, rateTransmitted, streamId, seqNr, bytesNewlyAckedLog, ecnCeMarkedBytesLog, stream->rateRtp, stream->rateTransmitted, stream->rateAcked, stream->rateLost, stream->rateCe,isMark);
+                        if (strlen(detailedLogExtraData) > 0) {
+                          fprintf(fp_log, ",%s", detailedLogExtraData);
+                        }
+                        bytesNewlyAckedLog = 0;
+                        ecnCeMarkedBytesLog = 0;
+		}
 		if (fp_log && completeLogItem) {
 			fprintf(fp_log, "\n");
 		}
-	}
+        }
+
 }
 
 /*
 *  Mark ACKed RTP packets
 */
-void ScreamTx::markAcked(uint32_t time_ntp,
+bool ScreamTx::markAcked(uint32_t time_ntp,
 	struct Transmitted *txPackets,
 	uint16_t seqNr,
 	uint32_t timestamp,
 	Stream *stream,
 	uint8_t ceBits,
-	uint16_t &encCeMarkedBytes,
-	bool isLast) {
+    int &encCeMarkedBytesLog,
+	bool isLast,
+    bool &isMark) {
 
+	bool isCe = false;
 	int ix = seqNr % kMaxTxPackets;
 	if (txPackets[ix].isUsed) {
 		/*
@@ -803,13 +819,15 @@ void ScreamTx::markAcked(uint32_t time_ntp,
 		*/
 		if ((tmp->seqNr == seqNr) & !tmp->isAcked) {
 			bytesDeliveredThisRtt += tmp->size;
+                        isMark = tmp->isMark;
 			if (ceBits == 0x03) {
 				/*
 				* Packet was CE marked, increase counter
 				*/
-				encCeMarkedBytes += tmp->size;
+				encCeMarkedBytesLog += tmp->size;
 				bytesMarkedThisRtt += tmp->size;
 				stream->bytesCe += tmp->size;
+				isCe = true;
 			}
 			tmp->isAcked = true;
 			ackedOwd = timestamp - tmp->timeTx_ntp;
@@ -859,8 +877,8 @@ void ScreamTx::markAcked(uint32_t time_ntp,
 
 			uint32_t rtt = time_ntp - tmp->timeTx_ntp;
 
-			if (fp_log && isLast) {
-				fprintf(fp_log, "%s,%1.3f,%1.3f,", timeString, queueDelay, rtt*ntp2SecScaleFactor);
+			if (fp_log && (isUseExtraDetailedLog || isLast || isMark)) {
+				fprintf(fp_log, "%s,%1.4f,%1.4f,", timeString, queueDelay, rtt*ntp2SecScaleFactor);
 				completeLogItem = true;
 			}
 			if (rtt < 1000000 && isLast) {
@@ -874,6 +892,7 @@ void ScreamTx::markAcked(uint32_t time_ntp,
 			stream->timeTxAck_ntp = tmp->timeTx_ntp;
 		}
 	}
+	return isCe;
 }
 
 /*
@@ -923,6 +942,7 @@ void ScreamTx::detectLoss(uint32_t time_ntp, struct Transmitted *txPackets, uint
 			*/
 			if (seqNrExt <= highestSeqNrExt && tmp->isAfterReceivedEdge == false) {
 				bytesNewlyAcked += tmp->size;
+				bytesNewlyAckedLog += tmp->size;
 				bytesInFlight -= tmp->size;
 				if (bytesInFlight < 0)
 					bytesInFlight = 0;
@@ -1041,6 +1061,14 @@ void ScreamTx::initialize(uint32_t time_ntp) {
 	initTime_ntp = time_ntp;
 }
 
+float ScreamTx::getTotalTargetBitrate() {
+     float totalTargetBitrate = 0.0f;
+     for (int n = 0; n < nStreams; n++) {
+         totalTargetBitrate += streams[n]->targetBitrate; 
+     }
+     return totalTargetBitrate;
+}
+
 /*
 * Update the  congestion window
 */
@@ -1107,11 +1135,7 @@ void ScreamTx::updateCwnd(uint32_t time_ntp) {
 		*/
 		paceInterval = kMinPaceInterval;
 		if ((queueDelayFractionAvg > 0.02f || isL4s || maxTotalBitrate > 0) && kEnablePacketPacing) {
-			/*
-			* The cautiousPacing parameter restricts transmission of large key frames when the parameter is set to a value closer to 1.0
-			*/
-			float pacingBitrate = (1.0f - cautiousPacing)*cwnd * 8.0f / std::max(0.001f, sRtt) + cautiousPacing * rateTransmittedAvg;
-			pacingBitrate = kPacketPacingHeadRoom * std::max(kMinimumBandwidth, pacingBitrate);
+                        float pacingBitrate = std::max(1.0e5f, packetPacingHeadroom*getTotalTargetBitrate());
 			if (maxTotalBitrate > 0) {
 				pacingBitrate = std::min(pacingBitrate, maxTotalBitrate);
 			}
@@ -1149,9 +1173,8 @@ void ScreamTx::updateCwnd(uint32_t time_ntp) {
 		int maxBytesInFlightHi = (int)(std::max(bytesInFlightMaxHi, bytesInFlightHistHiMem));
 		int maxBytesInFlightLo = (int)(std::max(bytesInFlight, bytesInFlightHistLoMem));
 
-		float alpha = std::max(queueDelayTrend, cautiousPacing);
 		maxBytesInFlight =
-			(maxBytesInFlightHi*(1.0f - alpha) + maxBytesInFlightLo * alpha)*
+			(maxBytesInFlightHi*(1.0f - queueDelayTrend) + maxBytesInFlightLo * queueDelayTrend)*
 			kMaxBytesInFlightHeadRoom;
 		if (enableSbd) {
 			/*
@@ -1742,7 +1765,6 @@ ScreamTx::Stream::Stream(ScreamTx *parent_,
 	lastTargetBitrateIUpdateT_ntp = 0;
 	bytesRtp = 0;
 	rateRtp = 0.0f;
-	ecnCeMarkedBytes = 0;
 	timeTxAck_ntp = 0;
 	lastTransmitT_ntp = 0;
 
@@ -1927,7 +1949,7 @@ void ScreamTx::Stream::updateTargetBitrate(uint32_t time_ntp) {
 			targetBitrate = std::max(minBitrate, targetBitrate*lossEventRateScale);
 		else if (ecnCeEventFlag) {
 			if (parent->isL4s) {
-				targetBitrate = std::max(minBitrate, targetBitrate*(1.0f - parent->l4sAlpha / 2.0f));
+				targetBitrate = std::max(minBitrate, targetBitrate*(1.0f - parent->l4sAlpha / 4.0f));
 			}
 			else {
 				targetBitrate = std::max(minBitrate, targetBitrate*ecnCeEventRateScale);

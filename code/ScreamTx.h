@@ -65,6 +65,8 @@ static const float kQueueDelayGuard = 0.1f;
 static const float kLossEventRateScale = 0.9f;
 // Video rate scaling due to ECN marking events
 static const float kEcnCeEventRateScale = 0.95f;
+// Headroom for packet pacing
+static const float kPacketPacingHeadRoom = 1.25f;
 
 // Constants
 /*
@@ -120,7 +122,7 @@ public:
 		float gainUp = kGainUp,
 		float gainDown = kGainDown,
 		int cwnd = 0,  // An initial cwnd larger than 2*mss
-		float cautiousPacing = 0.0f,
+		float packetPacingHeadroom = kPacketPacingHeadRoom,
 		int bytesInFlightHistSize = 5,
 		bool isL4s = false,
 		bool openWindow = false,
@@ -190,7 +192,8 @@ public:
 	float addTransmitted(uint32_t timestamp_ntp, // Wall clock ts when packet is transmitted
 		uint32_t ssrc,
 		int size,
-		uint16_t seqNr);
+		uint16_t seqNr,
+                bool isMark);
 
 	/* New incoming feedback, this function
 	 * triggers a CWND update
@@ -287,13 +290,26 @@ public:
 		strcpy(detailedLogExtraData,s);
 	}
 
-  /*
+        /* 
+        * Get the list of log items 
+        */
+        char *getDetailedLogItemList() {
+           return "\"Time [s]\",\"Estimated queue delay [s]\",\"RTT [s]\",\"Congestion window [byte]\",\"Bytes in flight [byte]\",\"Fast increase mode\",\"Total transmit bitrate [bps]\",\"Stream ID\",\"RTP SN\",\"Bytes newly ACKed\",\"Bytes newly ACKed and CE marked\",\"Media coder bitrate [bps]\",\"Transmitted bitrate [bps]\",\"ACKed bitrate [bps]\",\"Lost bitrate [bps]\",\"CE Marked bitrate [bps]\",\"Marker bit set\"";
+        }
+
+        /*
+        * Log each ACKed packet, 
+        */
+        void useExtraDetailedLog(bool isUseExtraDetailedLog_) {
+           isUseExtraDetailedLog = isUseExtraDetailedLog_;
+        }
+ 
+  	/*
 	* Set lowest possible cwndMin
 	*/
 	void setCwndMinLow(int aValue) {
 		cwndMinLow = aValue;
 	}
-
 
 private:
 	/*
@@ -303,6 +319,7 @@ private:
 		uint32_t timeTx_ntp;
 		int size;
 		uint16_t seqNr;
+                bool isMark;
 		bool isUsed;
 		bool isAcked;
 		bool isAfterReceivedEdge;
@@ -426,7 +443,6 @@ private:
 		uint32_t lastRtpQueueDiscardT_ntp;
 		bool wasRepairLoss;
 		bool repairLoss;
-		uint16_t ecnCeMarkedBytes;
 
 		Transmitted txPackets[kMaxTxPackets];
 		int txPacketsPtr;
@@ -439,15 +455,22 @@ private:
 
 	/*
 	* Mark ACKed RTP packets
+	* Return true if CE
 	*/
-	void markAcked(uint32_t time_ntp,
+	bool markAcked(uint32_t time_ntp,
 		struct Transmitted *txPackets,
 		uint16_t seqNr,
 		uint32_t timestamp,
 		Stream *stream,
 		uint8_t ceBits,
-		uint16_t &encCeMarkedBytes,
-		bool isLast);
+		int &encCeMarkedBytes,
+		bool isLast,
+                bool &isMark);
+
+        /*
+        * Get total target bitrate for all streams
+        */
+        float getTotalTargetBitrate();
 
 	/*
 	* Update CWND
@@ -551,7 +574,7 @@ private:
 	bool enableSbd;
 	float gainUp;
 	float gainDown;
-	float cautiousPacing;
+	float packetPacingHeadroom;
 
 	uint32_t sRttSh_ntp;
 	uint32_t sRtt_ntp;
@@ -625,6 +648,7 @@ private:
 	* ECN-CE
 	*/
 	bool ecnCeEvent;
+	bool isCeThisFeedback;
 
 	/*
 	* Fast start
@@ -677,6 +701,10 @@ private:
 	FILE *fp_log;
 	bool completeLogItem;
         char timeString[100];
+        bool isUseExtraDetailedLog;
+	int bytesNewlyAckedLog;
+        int ecnCeMarkedBytesLog;
+
 
 };
 }

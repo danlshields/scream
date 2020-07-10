@@ -61,6 +61,8 @@ float burstSleep = -1.0;
 bool isBurst = false;
 float burstStartTime = -1.0;
 float burstSleepTime = -1.0;
+bool pushTraffic = false;
+float packetPacingHeadroom=1.25f;
 
 
 uint16_t seqNr = 0;
@@ -181,7 +183,7 @@ void writeRtp(unsigned char *buf, uint16_t seqNr, uint32_t timeStamp, unsigned c
 }
 
 
-void sendPacket(char* buf, int size) {
+void sendPacket(void* buf, int size) {
   sendto(fd_outgoing_rtp, buf, size, 0, (struct sockaddr *)&outgoing_rtp_addr, sizeof(outgoing_rtp_addr));
 }
 
@@ -223,6 +225,7 @@ void *transmitRtpThread(void *arg) {
       do {
          gettimeofday(&start, 0);
          time_ntp = getTimeInNtp();
+
          retVal = screamTx->isOkToTransmit(time_ntp, SSRC);
          if (fixedRate > 0 && retVal >= 0.0f && sizeOfQueue > 0)
             retVal = paceIntervalFixedRate;
@@ -230,7 +233,7 @@ void *transmitRtpThread(void *arg) {
             retVal = 0.0f;
          if (retVal > 0.0f)
             accumulatedPaceTime += retVal;
-         if (retVal != -1.0) {// && accumulatedPaceTime <= MIN_PACE_INTERVAL_S) {
+         if (retVal != -1.0) {
            pthread_mutex_lock(&lock_rtp_queue);
            rtpQueue->pop(buf, size, seqNr);
            sendPacket(buf,size);
@@ -251,7 +254,7 @@ void *transmitRtpThread(void *arg) {
            retVal != -1.0f &&
            sizeOfQueue > 0);
       if (accumulatedPaceTime > 0) {
-	sleepTime_us = std::min((int)(accumulatedPaceTime*0.8*1e6f), MIN_PACE_INTERVAL_US*2);
+	sleepTime_us = std::min((int)(accumulatedPaceTime*1e6f), MIN_PACE_INTERVAL_US);
 	accumulatedPaceTime = 0.0f;
       }
     }
@@ -260,7 +263,6 @@ void *transmitRtpThread(void *arg) {
   }
   return NULL;
 }
-
 
 static int makePeriodic (unsigned int period, struct periodicInfo *info)
 {
@@ -319,7 +321,7 @@ void *createRtpThread(void *arg) {
   struct periodicInfo info;
 
   makePeriodic (dT_us, &info);
-  
+
   /*
   * Infinite loop that generates RTP packets
   */
@@ -342,8 +344,8 @@ void *createRtpThread(void *arg) {
       lastKeyFrameT_ntp = time_ntp;
     }
 
-    if (burstTime < 0) {
-      if ((time_ntp/6554) % 300 > 298) {
+    if (!pushTraffic && burstTime < 0) {
+      if ((time_ntp/6554) % 600 > 598) {
         /*
         * Drop bitrate for 100ms every 30s
         *  this ensures that the queue delay is estimated correctly
@@ -357,7 +359,7 @@ void *createRtpThread(void *arg) {
       if (burstStartTime < 0) {
         burstStartTime = time_s;
         isBurst = true;
-      } 
+      }
       if (time_s > burstStartTime+burstTime && isBurst) {
         isBurst = false;
         burstSleepTime = time_s;
@@ -373,23 +375,27 @@ void *createRtpThread(void *arg) {
     while (bytes > 0) {
       int pl_size = min(bytes,mtu);
       int recvlen = pl_size+12;
-    
+
       bytes = std::max(0, bytes-pl_size);
-      unsigned char pt = PT; 
+      unsigned char pt = PT;
       if (bytes == 0) {
         // Last RTP packet, set marker bit
         pt |= 0x80;
       }
       writeRtp(buf_rtp,seqNr,ts,pt);
 
-      pthread_mutex_lock(&lock_rtp_queue);
-      rtpQueue->push(buf_rtp, recvlen, seqNr, (time_ntp)/65536.0f);
-      pthread_mutex_unlock(&lock_rtp_queue);
+      if (pushTraffic) {
+         sendPacket(buf_rtp,recvlen);
+      } else {
+         pthread_mutex_lock(&lock_rtp_queue);
+         rtpQueue->push(buf_rtp, recvlen, seqNr, (time_ntp)/65536.0f);
+         pthread_mutex_unlock(&lock_rtp_queue);
 
-      pthread_mutex_lock(&lock_scream);
-      time_ntp = getTimeInNtp();
-      screamTx->newMediaFrame(time_ntp, SSRC, recvlen);
-      pthread_mutex_unlock(&lock_scream);
+         pthread_mutex_lock(&lock_scream);
+         time_ntp = getTimeInNtp();
+         screamTx->newMediaFrame(time_ntp, SSRC, recvlen);
+         pthread_mutex_unlock(&lock_scream);
+      }
       seqNr++;
     }
     waitPeriod (&info);
@@ -509,7 +515,8 @@ int setup() {
       perror("bind outgoing_rtp_addr failed");
       return 0;
   } else{
-    cerr<< "Listen on port "<< DECODER_PORT<<" to receive RTCP from decoder "<<endl;
+    if (!pushTraffic)
+       cerr<< "Listen on port "<< DECODER_PORT<<" to receive RTCP from decoder "<<endl;
   }
 
   if (sierraLog) {
@@ -551,7 +558,7 @@ int setup() {
                             false,
                             1.0f,2.0f,
                             (fixedRate*100)/8,
-                            0.0f,
+                            1.5f,
                             20,
                             ect==1,
                             true,
@@ -562,7 +569,7 @@ int setup() {
                             false,
                             1.0f,dscale,
                             (initRate*100)/8,
-                            0.0f,
+                            packetPacingHeadroom,
                             20,
                             ect==1,
                             false,
@@ -612,7 +619,7 @@ int main(int argc, char* argv[]) {
   * Parse command line
   */
   if (argc <= 1) {
-    cerr << "SCReAM BW test tool, sender. Ericsson AB. Version 2020-05-29" << endl;
+    cerr << "SCReAM BW test tool, sender. Ericsson AB. Version 2020-07-03" << endl;
     cerr << "Usage : " << endl << " > scream_bw_test_tx <options> decoder_ip decoder_port " << endl;
     cerr << "     -if name            bind to specific interface" << endl;
     cerr << "     -time value         run for time seconds (default infinite)" << endl;
@@ -620,6 +627,8 @@ int main(int argc, char* argv[]) {
     cerr << "         example -burst 1.0 0.2 burst media for 1s then sleeps for 0.2s " << endl;
     cerr << "     -nopace             disable packet pacing" << endl;
     cerr << "     -fixedrate value    set a fixed 'coder' bitrate " << endl;
+    cerr << "     -pushtraffic        just pushtraffic at a fixed bitrate, no feedback needed" << endl;
+    cerr << "                           must be used with -fixedrate option" << endl;
     cerr << "     -key val1 val2      set a given key frame interval [s] and size multiplier " << endl;
     cerr << "                          example -key 2.0 5.0 " << endl;
     cerr << "     -rand value         framesizes vary randomly around the nominal " << endl;
@@ -641,6 +650,7 @@ int main(int argc, char* argv[]) {
     cerr << "     -scale value        scale factor in case of loss or ECN event (default 0.9) " << endl;
     cerr << "     -dscale value       scale factor in case of increased delay (default 10.0) " << endl;
     cerr << "     -delaytarget value  set a queue delay target (default = 0.06s) " << endl;
+    cerr << "     -paceheadroom value set a packet pacing headroom (default = 1.25s) " << endl;
     cerr << "     -mtu value          set the max RTP payload size (default 1200 byte)" << endl;
     cerr << "     -fps value          set the frame rate (default 50)"  << endl;
     cerr << "     -clockdrift         enable clock drift compensation for the case that the"  << endl;
@@ -657,7 +667,7 @@ int main(int argc, char* argv[]) {
   }
   int ix = 1;
   bool verbose = false;
-  char *logFile = 0; 
+  char *logFile = 0;
   /* First find options */
   while (strstr(argv[ix],"-")) {
     if (strstr(argv[ix],"-ect")) {
@@ -668,115 +678,161 @@ int main(int argc, char* argv[]) {
         exit(0);
 
       }
+			continue;
     }
     if (strstr(argv[ix],"-time")) {
       runTime = atof(argv[ix+1]);
       ix+=2;
+			continue;
     }
     if (strstr(argv[ix],"-scale")) {
       scaleFactor = atof(argv[ix+1]);
       ix+=2;
+			continue;
     }
     if (strstr(argv[ix],"-dscale")) {
       dscale = atof(argv[ix+1]);
       ix+=2;
+			continue;
     }
     if (strstr(argv[ix],"-delaytarget")) {
       delayTarget = atof(argv[ix+1]);
       ix+=2;
+			continue;
     }
+
+    if (strstr(argv[ix],"-paceheadroom")) {
+      packetPacingHeadroom = atof(argv[ix+1]);
+      ix+=2;
+			continue;
+    }
+
     if (strstr(argv[ix],"-mtu")) {
       mtu = atoi(argv[ix+1]);
       ix+=2;
+			continue;
     }
     if (strstr(argv[ix],"-fixedrate")) {
       fixedRate = atoi(argv[ix+1]);
       ix+=2;
+			continue;
     }
     if (strstr(argv[ix],"-burst")) {
       burstTime = atof(argv[ix+1]);
       burstSleep = atof(argv[ix+2]);
       ix+=3;
+			continue;
     }
     if (strstr(argv[ix],"-key")) {
       isKeyFrame = true;
       keyFrameInterval = atof(argv[ix+1]);
       keyFrameSize = atof(argv[ix+2]);
       ix+=3;
+			continue;
     }
     if (strstr(argv[ix],"-nopace")) {
       disablePacing = true;
       ix++;
+			continue;
     }
     if (strstr(argv[ix],"-fps")) {
       FPS = atof(argv[ix+1]);
       ix+=2;
+			continue;
     }
     if (strstr(argv[ix],"-rand")) {
       randRate = atof(argv[ix+1])/100.0;
       ix+=2;
+			continue;
     }
     if (strstr(argv[ix],"-initrate")) {
       initRate = atoi(argv[ix+1]);
       ix+=2;
+			continue;
     }
     if (strstr(argv[ix],"-minrate")) {
       minRate = atoi(argv[ix+1]);
       ix+=2;
+			continue;
     }
     if (strstr(argv[ix],"-maxrate")) {
       maxRate = atoi(argv[ix+1]);
       ix+=2;
+			continue;
     }
     if (strstr(argv[ix],"-rateincrease")) {
       rateIncrease = atoi(argv[ix+1]);
       ix+=2;
+			continue;
     }
     if (strstr(argv[ix],"-ratescale")) {
       rateScale = atof(argv[ix+1]);
       ix+=2;
+			continue;
     }
     if (strstr(argv[ix],"-verbose")) {
       verbose = true;
       ix++;
+			continue;
     }
     if (strstr(argv[ix],"-nosummary")) {
       printSummary = false;
       ix++;
+			continue;
     }
     if (strstr(argv[ix],"-log")) {
       logFile = argv[ix+1];
       ix+=2;
+			continue;
     }
     if (strstr(argv[ix],"-sierralog")) {
       sierraLog = true;
       ix++;
+			continue;
     }
     if (strstr(argv[ix],"-ntp")) {
       ntp = true;
       ix++;
+			continue;
     }
     if (strstr(argv[ix],"-append")) {
       append = true;
       ix++;
+			continue;
     }
     if (strstr(argv[ix],"-itemlist")) {
       itemlist = true;
       ix++;
+			continue;
     }
     if (strstr(argv[ix],"-detailed")) {
       detailed = true;
       ix++;
+			continue;
+    }
+    if (strstr(argv[ix],"-pushtraffic")) {
+      pushTraffic = true;
+      ix++;
+			continue;
     }
     if (strstr(argv[ix],"-clockdrift")) {
       enableClockDriftCompensation = true;
       ix++;
+			continue;
     }
     if (strstr(argv[ix],"-if")) {
       ifname = argv[ix+1];
       ix+=2;
+			continue;
     }
+		cerr << "unexpected arg " << argv[ix] << endl;
+		exit(0);
+  }
 
+
+  if (pushTraffic && fixedRate==0) {
+     cerr << "Error : pushtraffic can only be used with fixedrate" << endl;
+     exit(-1);
   }
   if (logFile) {
       if (append)
@@ -802,7 +858,6 @@ int main(int argc, char* argv[]) {
   sigaction(SIGTERM, &action, NULL);
   sigaction(SIGINT, &action, NULL);
 
-  cerr << "Scream sender started! "<<endl;
   screamTx->setDetailedLogFp(fp_log);
   screamTx->useExtraDetailedLog(detailed);
 
@@ -812,60 +867,70 @@ int main(int argc, char* argv[]) {
 
   /* Create RTP thread */
   pthread_create(&create_rtp_thread,NULL,createRtpThread,(void*)"Create RTP thread...");
-  /* Create RTCP thread */
-  pthread_create(&rtcp_thread,NULL,readRtcpThread,(void*)"RTCP thread...");
-  /* Transmit RTP thread */
-  pthread_create(&transmit_rtp_thread,NULL,transmitRtpThread,(void*)"Transmit RTP thread...");
+  if (pushTraffic) {
+    cerr << "Scream sender started in push traffic mode " << fixedRate << "kbps" <<endl;
 
-  if (sierraLog) {
-    /* Sierra python log thread */
-    pthread_create(&sierra_python_thread,NULL,sierraPythonThread,(void*)"Sierra Python log thread...");
+    while (!stopThread && (runTime < 0 || getTimeInNtp() < runTime*65536.0f)) {
+       usleep(50000);
+    }
+    stopThread = true;
+
+  } else {
+     cerr << "Scream sender started! "<<endl;
+
+     /* Create RTCP thread */
+     pthread_create(&rtcp_thread,NULL,readRtcpThread,(void*)"RTCP thread...");
+     /* Transmit RTP thread */
+     pthread_create(&transmit_rtp_thread,NULL,transmitRtpThread,(void*)"Transmit RTP thread...");
+     if (sierraLog) {
+       /* Sierra python log thread */
+       pthread_create(&sierra_python_thread,NULL,sierraPythonThread,(void*)"Sierra Python log thread...");
+     }
+
+     while(!stopThread && (runTime < 0 || getTimeInNtp() < runTime*65536.0f)) {
+       uint32_t time_ntp = getTimeInNtp();
+       bool isFeedback = time_ntp-rtcp_rx_time_ntp < 65536; // 1s in Q16
+       if ((printSummary || !isFeedback) && time_ntp-lastLogT_ntp > 2*65536) { // 2s in Q16
+         if (!isFeedback) {
+	        cerr << "No RTCP feedback received" << endl;
+         } else {
+	        float time_s = time_ntp/65536.0f;
+           char s[500];
+           screamTx->getStatistics(time_s, s);
+           if (sierraLog)
+             cout << s << endl << "      CellId, RSRP, RSSI, SINR: {" << sierraLogString << "}" << endl << endl;
+           else
+             cout << s << endl;
+         }
+         lastLogT_ntp = time_ntp;
+       }
+       if (verbose && time_ntp-lastLogTv_ntp > 13107) { // 0.2s in Q16
+         if (isFeedback) {
+           float time_s = time_ntp/65536.0f;
+           char s[500];
+           char s1[500];
+           screamTx->getVeryShortLog(time_s, s1);
+           if (sierraLog)
+             sprintf(s,"%8.3f, %s %s ", time_s, s1, sierraLogString);
+           else
+             sprintf(s,"%8.3f, %s ", time_s, s1);
+
+           cout << s << endl;
+           /*
+            * Send statistics to receiver this can be used to
+            * verify reliability of remote control
+            */
+           s1[0] = 0x80;
+           s1[1] = 0x7F; // Set PT = 0x7F for statistics packet
+           memcpy(&s1[2],s,strlen(s));
+           sendPacket(s1, strlen(s)+2);
+         }
+         lastLogTv_ntp = time_ntp;
+       }
+       usleep(50000);
+     };
+     stopThread = true;
   }
-
-  while(!stopThread && (runTime < 0 || getTimeInNtp() < runTime*65536.0f)) {
-    uint32_t time_ntp = getTimeInNtp();
-    bool isFeedback = time_ntp-rtcp_rx_time_ntp < 65536; // 1s in Q16
-    if ((printSummary || !isFeedback) && time_ntp-lastLogT_ntp > 2*65536) { // 2s in Q16
-      if (!isFeedback) {
-	      cerr << "No RTCP feedback received" << endl;
-      } else {
-	      float time_s = time_ntp/65536.0f;
-        char s[500];
-        screamTx->getStatistics(time_s, s);
-        if (sierraLog)
-          cout << s << endl << "      CellId, RSRP, RSSI, SINR: {" << sierraLogString << "}" << endl << endl;
-        else
-          cout << s << endl;
-      }
-      lastLogT_ntp = time_ntp;
-    }
-    if (verbose && time_ntp-lastLogTv_ntp > 13107) { // 0.2s in Q16
-      if (isFeedback) {
-        float time_s = time_ntp/65536.0f;
-        char s[500];
-        char s1[500];
-        screamTx->getVeryShortLog(time_s, s1);
-        if (sierraLog)
-          sprintf(s,"%8.3f, %s %s ", time_s, s1, sierraLogString);
-        else
-          sprintf(s,"%8.3f, %s ", time_s, s1);
-
-        cout << s << endl;
-        /*
-         * Send statistics to receiver this can be used to
-         * verify reliability of remote control
-         */
-        s1[0] = 0x80;
-        s1[1] = 0x7F; // Set PT = 0x7F for statistics packet
-        memcpy(&s1[2],s,strlen(s));
-        sendPacket(s1, strlen(s)+2);
-      }
-      lastLogTv_ntp = time_ntp;
-    }
-    usleep(50000);
-  };
-  stopThread = true;
-
   usleep(500000);
   close(fd_outgoing_rtp);
   if (fp_log)
